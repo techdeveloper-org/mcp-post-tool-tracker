@@ -29,12 +29,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils.path_resolver import get_config_dir
 
-from mcp.server.fastmcp import FastMCP
+# mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
+# Both names are probed so this server runs under either major version; the
+# API used below (tool decorator, run(transport=...)) is identical in both.
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # mcp < 2.0
+    from mcp.server.fastmcp import FastMCP as MCPServer
 from base.response import to_json
 from base.decorators import mcp_tool_handler
 from base.persistence import AtomicJsonStore, SessionIdResolver
 
-mcp = FastMCP(
+mcp = MCPServer(
     "post-tool-tracker",
     instructions="Post-tool tracking: progress, flags, metrics after every tool call"
 )
