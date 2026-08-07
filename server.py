@@ -24,10 +24,11 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from utils.path_resolver import get_config_dir
+from utils.path_resolver import get_claude_home, get_config_dir
 
 # mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
 # Both names are probed so this server runs under either major version; the
@@ -36,9 +37,15 @@ try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 from base.response import to_json
 from base.decorators import mcp_tool_handler
-from base.persistence import AtomicJsonStore, SessionIdResolver
+from base.persistence import (
+    AtomicJsonStore,
+    ConcurrentModificationError,
+    SessionIdResolver,
+)
 
 mcp = MCPServer(
     "post-tool-tracker",
@@ -54,6 +61,14 @@ CURRENT_SESSION_FILE = MEMORY_PATH / ".current-session.json"
 # Persistence singletons
 _progress_store = AtomicJsonStore(PROGRESS_FILE)
 _session_resolver = SessionIdResolver(MEMORY_PATH)
+
+# Read-only annotation reused by every tool that only reads tracking state.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 # Progress delta per tool type (complexity-weighted in track_tool_usage)
 PROGRESS_DELTA = {
@@ -88,13 +103,15 @@ def _default_progress() -> dict:
 
 
 def _load_progress() -> dict:
-    """Load session progress state via AtomicJsonStore."""
+    """Load session progress state via AtomicJsonStore.
+
+    Read-only snapshot for status/reporting tools. Never call this and then
+    write the result back with ``_progress_store.save()`` -- any tool that
+    derives a new value from the current state must use
+    ``_progress_store.modify()`` instead, or a concurrent update is
+    silently lost.
+    """
     return _progress_store.load(default=_default_progress())
-
-
-def _save_progress(state: dict):
-    """Save session progress atomically via AtomicJsonStore."""
-    _progress_store.save(state)
 
 
 def _log_tool_entry(entry: dict):
@@ -122,13 +139,24 @@ def _estimate_context_pct(tool_counts: dict, content_chars: int = 0) -> int:
 # TOOL 1: TRACK TOOL USAGE (Main entry point)
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=False, openWorldHint=False))
 @mcp_tool_handler
 def track_tool_usage(
-    tool_name: str,
-    tool_input: str = "{}",
-    is_error: bool = False,
-    response_chars: int = 0
+    tool_name: Annotated[str, Field(
+        description="Tool that was just called, e.g. 'Write', 'Edit', 'Bash', "
+                    "'Read'. Determines the progress weight applied.")],
+    tool_input: Annotated[str, Field(
+        description="JSON object string of the parameters the tool was called "
+                    "with. Invalid JSON is treated as an empty parameter set.")] = "{}",
+    is_error: Annotated[bool, Field(
+        description="True when the tool call failed. Errored calls contribute "
+                    "no progress and increment the session error count.")] = False,
+    response_chars: Annotated[int, Field(
+        ge=0,
+        description="Approximate character count of the tool's response, used "
+                    "to estimate context-window consumption.")] = 0,
 ) -> str:
     """Track a completed tool call with rich activity data.
 
@@ -147,25 +175,43 @@ def track_tool_usage(
         params = {}
 
     try:
-        state = _load_progress()
         session_id = _get_session_id()
+
+        # Captured once and reused across every compare-and-swap retry of
+        # the state mutation below, rather than regenerated per attempt.
+        # This is the single logical timestamp for this tool-call event and
+        # must match the "ts" already written to the (unretried) JSONL log
+        # entry, so the two artifacts agree on when the call happened.
         now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         warnings = []
 
-        # Load flow-trace for complexity
+        # Load flow-trace for complexity. A missing trace is normal; an
+        # unreadable one is reported as a warning rather than silently treated
+        # as complexity 0, which would disable phase enforcement invisibly.
+        # This reads a different file than the progress store and is not
+        # subject to the compare-and-swap race below, so a single read here
+        # -- reused across any retry of the state update -- is correct.
         complexity = 0
-        try:
+        if session_id:
             trace_file = LOGS_PATH / "sessions" / session_id / "flow-trace.json"
-            if trace_file.exists():
+            try:
                 trace = json.loads(trace_file.read_text(encoding="utf-8"))
                 if isinstance(trace, list) and trace:
                     trace = trace[-1]
-                fd = trace.get("final_decision", {})
-                complexity = fd.get("complexity", 0)
-        except Exception:
-            pass
+                if isinstance(trace, dict):
+                    complexity = trace.get("final_decision", {}).get("complexity", 0)
+            except FileNotFoundError:
+                pass
+            except (json.JSONDecodeError, OSError, AttributeError, TypeError) as e:
+                warnings.append(
+                    f"flow-trace unreadable ({type(e).__name__}) - complexity "
+                    "checks skipped for this call"
+                )
 
-        # Calculate complexity-weighted progress delta
+        # Calculate complexity-weighted progress delta. Derived only from
+        # this call's own inputs (tool_name, is_error, complexity), never
+        # from the progress store, so it is safe to compute once and reuse
+        # across every retry of the state mutation.
         base_delta = 0 if is_error else PROGRESS_DELTA.get(tool_name, 0)
         if complexity >= 15 and base_delta > 0:
             delta = max(1, base_delta // 4)
@@ -207,46 +253,87 @@ def track_tool_usage(
         elif tool_name == "Skill":
             entry["skill_name"] = params.get("skill", "")
 
-        _log_tool_entry(entry)
+        # A single, unretried append to tool-tracker.jsonl. This must not
+        # move inside the state mutator below: the mutator can run more
+        # than once per call, and JsonlAppender-style appends are not
+        # idempotent, so retrying it would duplicate log lines.
+        entry_logged = _log_tool_entry(entry)
+        if not entry_logged:
+            warnings.append(
+                "No active session - tool entry was not persisted to "
+                "tool-tracker.jsonl"
+            )
 
-        # Update progress state
-        state["total_progress"] = min(100, state["total_progress"] + delta)
-        state["tool_counts"][tool_name] = state["tool_counts"].get(tool_name, 0) + 1
-        state["last_tool"] = tool_name
-        state["last_tool_at"] = now
-        state["content_chars"] = state.get("content_chars", 0) + response_chars
-        state["context_estimate_pct"] = _estimate_context_pct(
-            state["tool_counts"], state.get("content_chars", 0)
-        )
-
-        if is_error:
-            state["errors_seen"] = state.get("errors_seen", 0) + 1
-
-        # Track modified files since last commit
+        modified_file_path = ""
         if tool_name in ("Write", "Edit", "NotebookEdit") and not is_error:
             fp = params.get("file_path", "")
             if fp:
-                modified = state.get("modified_files_since_commit", [])
-                short = "/".join(fp.replace("\\", "/").split("/")[-3:])
-                if short not in modified:
-                    modified.append(short)
-                state["modified_files_since_commit"] = modified
+                modified_file_path = "/".join(fp.replace("\\", "/").split("/")[-3:])
 
-        # Clear flags on appropriate tools
+        status_completed = (
+            tool_name == "TaskUpdate" and params.get("status", "") == "completed"
+        )
+
+        # Flag clearing is a filesystem side effect independent of the
+        # progress store: it must run exactly once, driven only by this
+        # call's own tool_name/is_error, and must not live inside the
+        # mutator passed to modify() below.
         if tool_name == "TaskCreate" and not is_error:
-            state["tasks_created"] = state.get("tasks_created", 0) + 1
             _clear_flag("task-breakdown-pending", session_id)
-
         if tool_name in ("Skill", "Task") and not is_error:
             _clear_flag("skill-selection-pending", session_id)
 
-        # Task update frequency enforcement
-        if tool_name in ("TaskUpdate", "TaskCreate"):
-            state["tools_since_last_update"] = 0
-        else:
-            state["tools_since_last_update"] = state.get("tools_since_last_update", 0) + 1
+        def _apply(data: dict) -> None:
+            """Fold this tool call's effects into the freshly loaded state.
 
-        tools_since = state["tools_since_last_update"]
+            Runs once per compare-and-swap attempt inside ``modify()``, so
+            every field derived from prior state -- total_progress,
+            tool_counts, content_chars, the modified-files list,
+            tasks_created, tools_since_last_update, tasks_completed -- is
+            recomputed from the version that just won the race rather than
+            a value captured from an earlier, possibly stale, attempt.
+            """
+            data["total_progress"] = min(100, data.get("total_progress", 0) + delta)
+            tool_counts = data.get("tool_counts", {})
+            tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
+            data["tool_counts"] = tool_counts
+            data["last_tool"] = tool_name
+            data["last_tool_at"] = now
+            content_chars = data.get("content_chars", 0) + response_chars
+            data["content_chars"] = content_chars
+            data["context_estimate_pct"] = _estimate_context_pct(
+                tool_counts, content_chars
+            )
+
+            if is_error:
+                data["errors_seen"] = data.get("errors_seen", 0) + 1
+
+            if modified_file_path:
+                modified = data.get("modified_files_since_commit", [])
+                if modified_file_path not in modified:
+                    modified.append(modified_file_path)
+                data["modified_files_since_commit"] = modified
+
+            if tool_name == "TaskCreate" and not is_error:
+                data["tasks_created"] = data.get("tasks_created", 0) + 1
+
+            if tool_name in ("TaskUpdate", "TaskCreate"):
+                data["tools_since_last_update"] = 0
+            else:
+                data["tools_since_last_update"] = (
+                    data.get("tools_since_last_update", 0) + 1
+                )
+
+            if status_completed:
+                data["tasks_completed"] = data.get("tasks_completed", 0) + 1
+
+        state = _progress_store.modify(_apply, default=_default_progress())
+
+        # Read the published values back from what modify() actually
+        # persisted rather than from any local variable computed during a
+        # (possibly losing) attempt, so a warning can never disagree with
+        # what was stored.
+        tools_since = state.get("tools_since_last_update", 0)
         if tools_since > 5 and tool_name in ("Write", "Edit", "Bash", "NotebookEdit"):
             if complexity >= 3:
                 warnings.append(
@@ -254,20 +341,12 @@ def track_tool_usage(
                     "update every 2-3 calls (max 5)"
                 )
 
-        # Complexity phase enforcement
         if complexity >= 6 and state.get("tasks_created", 0) == 0:
             if tool_name in ("Write", "Edit", "NotebookEdit"):
                 warnings.append(
                     f"Complexity={complexity} but 0 tasks created - "
                     "phased execution required for complexity >= 6"
                 )
-
-        if tool_name == "TaskUpdate":
-            status = params.get("status", "")
-            if status == "completed":
-                state["tasks_completed"] = state.get("tasks_completed", 0) + 1
-
-        _save_progress(state)
 
         return to_json({
             "success": True,
@@ -276,8 +355,11 @@ def track_tool_usage(
             "total_progress": state["total_progress"],
             "context_estimate_pct": state["context_estimate_pct"],
             "warnings": warnings,
+            "entry_logged": entry_logged,
             "session_id": session_id
         })
+    except (ConcurrentModificationError, TimeoutError):
+        raise
     except Exception as e:
         return to_json({"success": False, "error": str(e)})
 
@@ -290,7 +372,7 @@ def _clear_flag(flag_name: str, session_id: str):
     fp = LOGS_PATH / "sessions" / session_id / "flags" / f"{flag_name}.json"
     fp.unlink(missing_ok=True)
     # Legacy
-    legacy = Path.home() / ".claude" / f".{flag_name}-{session_id}.json"
+    legacy = get_claude_home() / f".{flag_name}-{session_id}.json"
     legacy.unlink(missing_ok=True)
 
 
@@ -298,9 +380,18 @@ def _clear_flag(flag_name: str, session_id: str):
 # TOOL 2: INCREMENT PROGRESS (Manual)
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=False, openWorldHint=False))
 @mcp_tool_handler
-def increment_progress(delta: int = 5, reason: str = "") -> str:
+def increment_progress(
+    delta: Annotated[int, Field(
+        ge=1, le=20,
+        description="Progress points to add, 1 through 20. Total progress is "
+                    "capped at 100.")] = 5,
+    reason: Annotated[str, Field(
+        description="Why progress is being incremented, for the audit trail.")] = "",
+) -> str:
     """Manually increment session progress.
 
     Args:
@@ -308,15 +399,22 @@ def increment_progress(delta: int = 5, reason: str = "") -> str:
         reason: Reason for increment
     """
     try:
-        state = _load_progress()
-        state["total_progress"] = min(100, state["total_progress"] + delta)
-        _save_progress(state)
+        def _bump(data: dict) -> None:
+            """Add delta to total_progress, recomputed from the fresh dict
+            on every compare-and-swap retry so a concurrent tool call's
+            increment is never overwritten.
+            """
+            data["total_progress"] = min(100, data.get("total_progress", 0) + delta)
+
+        state = _progress_store.modify(_bump, default=_default_progress())
         return to_json({
             "success": True,
             "total_progress": state["total_progress"],
             "delta": delta,
             "reason": reason
         })
+    except (ConcurrentModificationError, TimeoutError):
+        raise
     except Exception as e:
         return to_json({"success": False, "error": str(e)})
 
@@ -325,9 +423,15 @@ def increment_progress(delta: int = 5, reason: str = "") -> str:
 # TOOL 3: CLEAR ENFORCEMENT FLAG
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
-def clear_enforcement_flag(flag_name: str) -> str:
+def clear_enforcement_flag(
+    flag_name: Annotated[str, Field(
+        description="Flag to clear for the current session: "
+                    "'task-breakdown-pending' or 'skill-selection-pending'.")],
+) -> str:
     """Clear a specific enforcement flag for current session.
 
     Args:
@@ -349,7 +453,7 @@ def clear_enforcement_flag(flag_name: str) -> str:
 # TOOL 4: GET PROGRESS STATUS
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
 def get_progress_status() -> str:
     """Get current session progress snapshot."""
@@ -377,7 +481,7 @@ def get_progress_status() -> str:
 # TOOL 5: GET TOOL STATS
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
 def get_tool_stats() -> str:
     """Get detailed tool usage statistics for current session."""
@@ -427,7 +531,7 @@ def get_tool_stats() -> str:
 # TOOL 6: CHECK COMMIT READINESS
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
 def check_commit_readiness() -> str:
     """Check if auto-commit should be triggered based on modified files."""
