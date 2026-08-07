@@ -24,10 +24,11 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from utils.path_resolver import get_config_dir
+from utils.path_resolver import get_claude_home, get_config_dir
 
 # mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
 # Both names are probed so this server runs under either major version; the
@@ -36,6 +37,8 @@ try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 from base.response import to_json
 from base.decorators import mcp_tool_handler
 from base.persistence import AtomicJsonStore, SessionIdResolver
@@ -54,6 +57,14 @@ CURRENT_SESSION_FILE = MEMORY_PATH / ".current-session.json"
 # Persistence singletons
 _progress_store = AtomicJsonStore(PROGRESS_FILE)
 _session_resolver = SessionIdResolver(MEMORY_PATH)
+
+# Read-only annotation reused by every tool that only reads tracking state.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 # Progress delta per tool type (complexity-weighted in track_tool_usage)
 PROGRESS_DELTA = {
@@ -122,13 +133,24 @@ def _estimate_context_pct(tool_counts: dict, content_chars: int = 0) -> int:
 # TOOL 1: TRACK TOOL USAGE (Main entry point)
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=False, openWorldHint=False))
 @mcp_tool_handler
 def track_tool_usage(
-    tool_name: str,
-    tool_input: str = "{}",
-    is_error: bool = False,
-    response_chars: int = 0
+    tool_name: Annotated[str, Field(
+        description="Tool that was just called, e.g. 'Write', 'Edit', 'Bash', "
+                    "'Read'. Determines the progress weight applied.")],
+    tool_input: Annotated[str, Field(
+        description="JSON object string of the parameters the tool was called "
+                    "with. Invalid JSON is treated as an empty parameter set.")] = "{}",
+    is_error: Annotated[bool, Field(
+        description="True when the tool call failed. Errored calls contribute "
+                    "no progress and increment the session error count.")] = False,
+    response_chars: Annotated[int, Field(
+        ge=0,
+        description="Approximate character count of the tool's response, used "
+                    "to estimate context-window consumption.")] = 0,
 ) -> str:
     """Track a completed tool call with rich activity data.
 
@@ -152,18 +174,25 @@ def track_tool_usage(
         now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         warnings = []
 
-        # Load flow-trace for complexity
+        # Load flow-trace for complexity. A missing trace is normal; an
+        # unreadable one is reported as a warning rather than silently treated
+        # as complexity 0, which would disable phase enforcement invisibly.
         complexity = 0
-        try:
+        if session_id:
             trace_file = LOGS_PATH / "sessions" / session_id / "flow-trace.json"
-            if trace_file.exists():
+            try:
                 trace = json.loads(trace_file.read_text(encoding="utf-8"))
                 if isinstance(trace, list) and trace:
                     trace = trace[-1]
-                fd = trace.get("final_decision", {})
-                complexity = fd.get("complexity", 0)
-        except Exception:
-            pass
+                if isinstance(trace, dict):
+                    complexity = trace.get("final_decision", {}).get("complexity", 0)
+            except FileNotFoundError:
+                pass
+            except (json.JSONDecodeError, OSError, AttributeError, TypeError) as e:
+                warnings.append(
+                    f"flow-trace unreadable ({type(e).__name__}) - complexity "
+                    "checks skipped for this call"
+                )
 
         # Calculate complexity-weighted progress delta
         base_delta = 0 if is_error else PROGRESS_DELTA.get(tool_name, 0)
@@ -207,7 +236,12 @@ def track_tool_usage(
         elif tool_name == "Skill":
             entry["skill_name"] = params.get("skill", "")
 
-        _log_tool_entry(entry)
+        entry_logged = _log_tool_entry(entry)
+        if not entry_logged:
+            warnings.append(
+                "No active session - tool entry was not persisted to "
+                "tool-tracker.jsonl"
+            )
 
         # Update progress state
         state["total_progress"] = min(100, state["total_progress"] + delta)
@@ -276,6 +310,7 @@ def track_tool_usage(
             "total_progress": state["total_progress"],
             "context_estimate_pct": state["context_estimate_pct"],
             "warnings": warnings,
+            "entry_logged": entry_logged,
             "session_id": session_id
         })
     except Exception as e:
@@ -290,7 +325,7 @@ def _clear_flag(flag_name: str, session_id: str):
     fp = LOGS_PATH / "sessions" / session_id / "flags" / f"{flag_name}.json"
     fp.unlink(missing_ok=True)
     # Legacy
-    legacy = Path.home() / ".claude" / f".{flag_name}-{session_id}.json"
+    legacy = get_claude_home() / f".{flag_name}-{session_id}.json"
     legacy.unlink(missing_ok=True)
 
 
@@ -298,9 +333,18 @@ def _clear_flag(flag_name: str, session_id: str):
 # TOOL 2: INCREMENT PROGRESS (Manual)
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=False, openWorldHint=False))
 @mcp_tool_handler
-def increment_progress(delta: int = 5, reason: str = "") -> str:
+def increment_progress(
+    delta: Annotated[int, Field(
+        ge=1, le=20,
+        description="Progress points to add, 1 through 20. Total progress is "
+                    "capped at 100.")] = 5,
+    reason: Annotated[str, Field(
+        description="Why progress is being incremented, for the audit trail.")] = "",
+) -> str:
     """Manually increment session progress.
 
     Args:
@@ -325,9 +369,15 @@ def increment_progress(delta: int = 5, reason: str = "") -> str:
 # TOOL 3: CLEAR ENFORCEMENT FLAG
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
-def clear_enforcement_flag(flag_name: str) -> str:
+def clear_enforcement_flag(
+    flag_name: Annotated[str, Field(
+        description="Flag to clear for the current session: "
+                    "'task-breakdown-pending' or 'skill-selection-pending'.")],
+) -> str:
     """Clear a specific enforcement flag for current session.
 
     Args:
@@ -349,7 +399,7 @@ def clear_enforcement_flag(flag_name: str) -> str:
 # TOOL 4: GET PROGRESS STATUS
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
 def get_progress_status() -> str:
     """Get current session progress snapshot."""
@@ -377,7 +427,7 @@ def get_progress_status() -> str:
 # TOOL 5: GET TOOL STATS
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
 def get_tool_stats() -> str:
     """Get detailed tool usage statistics for current session."""
@@ -427,7 +477,7 @@ def get_tool_stats() -> str:
 # TOOL 6: CHECK COMMIT READINESS
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
 def check_commit_readiness() -> str:
     """Check if auto-commit should be triggered based on modified files."""
