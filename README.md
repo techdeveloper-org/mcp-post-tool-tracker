@@ -2,11 +2,11 @@
 
 ![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![License MIT](https://img.shields.io/badge/License-MIT-green)
-![Part of claude-workflow-engine](https://img.shields.io/badge/Part%20of-claude--workflow--engine-orange)
+![Part of ai-native-sdlc-engine](https://img.shields.io/badge/Part%20of-claude--workflow--engine-orange)
 
 A FastMCP server that tracks tool usage, session progress, and commit readiness after every tool call in a Claude Code session. It is invoked automatically by the **PostToolUse** Claude Code hook and persists rich activity data to `tool-tracker.jsonl` and `session-progress.json`.
 
-This server is one of 13 MCP servers in the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem — a LangGraph orchestration pipeline for automating Claude Code development workflows.
+This server is one of 13 MCP servers in the [Claude Workflow Engine](https://github.com/techdeveloper-org/ai-native-sdlc-engine) ecosystem — a LangGraph orchestration pipeline for automating Claude Code development workflows.
 
 ---
 
@@ -265,7 +265,7 @@ The server applies the following base progress deltas per tool call. At complexi
 | [mcp-git-ops](https://github.com/techdeveloper-org/mcp-git-ops) | Git operations; consumes commit readiness signal from this server |
 | [mcp-token-optimizer](https://github.com/techdeveloper-org/mcp-token-optimizer) | Token reduction; 60-85% context savings via smart reads |
 
-All 13 servers and the shared base library are documented in the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) repository.
+All 13 servers and the shared base library are documented in the [Claude Workflow Engine](https://github.com/techdeveloper-org/ai-native-sdlc-engine) repository.
 
 ---
 
